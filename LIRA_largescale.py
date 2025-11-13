@@ -1,7 +1,7 @@
 '''
 LIRA for large-scale datasets
 1. Full redundancy with probing model is used on every data point, which means that each data point is assigned to two partitions.
-2. Internal index is recommended to be HNSW, which is more efficient than FLAT.
+2. Internal index uses FLAT for exact search within each partition.
 cluster, bucket, partition are used interchangeably.
 '''
 import numpy as np
@@ -27,28 +27,26 @@ from tqdm import tqdm
 @dataclass
 class Config:
     method_name: str = 'LIRA_fullRE_subtrain'
-    dataset: str = 'deep50M' # sift, glove, bigann, deep50M, text2image50M, deep100M
+    dataset: str = 'deep50M' # dataset name
+    data_path: str = '/data/vector_datasets' # base path for datasets
     dis_metric: str = None
     k: int = 100
     n_bkt: int = 1024 # 64 for small-scale; 1024 for large-scale
     n_epoch: int = 30 # model training epoch, 10 for small-scale; 30 for large-scale
     batch_size: int = 512
     n_mul: int = 2
-    inner_index_type: str = 'HNSW' # 'HNSW', 'FLAT' # type of internal index
 
     repa_step: int = 1 # full redundancy
     duplicate_type = 'model' # 'None' 'model'
-    ef_fixed: int = 128
-    hnsw_M: int = 32
 
-    pth_log: str = f'./logs/{dataset}/{method_name}_{inner_index_type}/'
-    file_name: str = f'{dataset}-k={k}-ML_kmeans={n_bkt}_{inner_index_type}_ReType={duplicate_type}'
+    pth_log: str = f'./logs/{dataset}/{method_name}_FLAT/'
+    file_name: str = f'{dataset}-k={k}-ML_kmeans={n_bkt}_FLAT_ReType={duplicate_type}'
     log_name: str = f'{file_name}.txt'
     df_name: str = f'{file_name}.csv'
 
     def update(self):
         if self.dis_metric == None:
-            self.dis_metric = 'inner_product' if self.dataset in ['glove', 'text2image50M'] else 'L2'
+            self.dis_metric = 'L2'  # default to L2 distance
     
 def mul_partition_by_model(data_partition_score, data_predicts, global_xd_ids, start_idx, data_2_bkt, cluster_cnts, cluster_ids):
     _, n_mul = data_2_bkt.shape
@@ -142,20 +140,10 @@ def get_cmp_recall(inner_indexes, x_q, xd_id_bkt, cfg):
         for q_id in range(n_q):
             q = x_q[q_id].reshape(1, -1)
             t_start = time.time()
-            if cfg.inner_index_type == 'HNSW':
-                inner_index.hnsw.efSearch = cfg.ef_fixed
-                hnsw_stats = faiss.cvar.hnsw_stats
-                hnsw_stats.reset()
-                _, idx_in_bkt = inner_index.search(q, cfg.k) # get the top-k id in the current bucket
-                aknn_id = xd_id_bid[idx_in_bkt.reshape(-1)] # Note that idx_in_bkt is relative to the bkt, convert to the global id.
-                found_aknn_id[q_id][b_id] = aknn_id
-                cmp_distr_all[q_id][b_id] = int(hnsw_stats.ndis)
-            elif cfg.inner_index_type == 'FLAT':
-                _, idx_in_bkt = inner_index.search(q, cfg.k)
-                aknn_id = xd_id_bid[idx_in_bkt.reshape(-1)]
-                found_aknn_id[q_id][b_id] = aknn_id
-                cmp_distr_all[q_id][b_id] = inner_index.ntotal
-            
+            _, idx_in_bkt = inner_index.search(q, cfg.k)
+            aknn_id = xd_id_bid[idx_in_bkt.reshape(-1)]
+            found_aknn_id[q_id][b_id] = aknn_id
+            cmp_distr_all[q_id][b_id] = inner_index.ntotal
             search_time[q_id][b_id] = time.time() - t_start
 
     return search_time, cmp_distr_all, found_aknn_id
@@ -203,7 +191,10 @@ if __name__ == "__main__":
     fw = open(cfg.pth_log + cfg.log_name, 'a', encoding='utf-8')
     
     # (1) load data and query
-    x_d, x_q, _, _ = load_data(cfg.dataset)
+    x_d, x_q, gt_ids = load_data(cfg.dataset, data_path=cfg.data_path)
+    if gt_ids is None:
+        raise ValueError(f"Ground truth file not found for dataset {cfg.dataset}. Please ensure {cfg.dataset}_groundtruth.ivecs exists.")
+    
     fprint(f">> dataset: {cfg.dataset}, data_sizes: {x_d.shape}, query_size: {x_q.shape}, n_bkt: {n_bkt}, knn: {cfg.k}, num_threads: {num_threads}", fw)
     n_d, dim = x_d.shape
     n_q, dim = x_q.shape
@@ -218,8 +209,29 @@ if __name__ == "__main__":
     xd_sub = x_d[sub_idx]
 
     fprint(">> begin data preprocessing (please wait a few minutes)", fw)
-    knn_data_sub = get_flat_GT_knn(xd_sub, xd_sub, cfg, datatype="data")
-    knn_query_sub = get_flat_GT_knn(xd_sub, x_q, cfg)
+    # Compute data self-KNN for training (on subset, prefer C++ precomputed cache)
+    knn_data_sub = compute_data_knn(xd_sub, cfg, data_path=cfg.data_path)
+    
+    # For query ground truth on subset, we need to compute it since gt_ids is on full dataset
+    # Create temporary config for subset search
+    cache_dir = os.path.join(cfg.data_path, cfg.dataset, 'knn_cache')
+    os.makedirs(cache_dir, exist_ok=True)
+    cache_file = os.path.join(cache_dir, f'{cfg.dataset}-query_on_subset_knn{cfg.k}-nsub{nd_sub}.npy')
+    
+    if not os.path.exists(cache_file):
+        print(f"Computing query KNN on data subset...")
+        dim = xd_sub.shape[1]
+        if cfg.dis_metric == 'inner_product':
+            index_flat = faiss.IndexFlatIP(dim)
+        else:
+            index_flat = faiss.IndexFlatL2(dim)
+        index_flat.add(xd_sub)
+        _, knn_query_sub = index_flat.search(x_q, cfg.k)
+        np.save(cache_file, knn_query_sub)
+        print(f"Cached query-on-subset KNN to: {cache_file}")
+    else:
+        knn_query_sub = np.load(cache_file).astype(int)
+        print(f"Loaded cached query-on-subset KNN from: {cache_file}")
 
     # (2) initial partitioning
     data_2_bkt_sub = np.full((nd_sub, cfg.n_mul), -1) # -1 for empty value
@@ -287,7 +299,9 @@ if __name__ == "__main__":
         cluster_ids[cid].append(idx)
 
     fprint(">> begin data preprocessing (please wait a few minutes)", fw)
-    knn_query = get_flat_GT_knn(x_d, x_q, cfg)
+    # Use precomputed ground truth for queries on full dataset
+    knn_query = gt_ids[:, :cfg.k]  # Use first k neighbors from ground truth
+    fprint(f">> using precomputed ground truth with shape: {knn_query.shape}", fw)
     print(">> begin get knn distribution")
     knn_distr_cnt_query, knn_distr_id_query = get_knn_distr_redundancy(knn_query, data_2_bkt, cfg)
 
@@ -297,8 +311,8 @@ if __name__ == "__main__":
         print(">> before redundancy")
         time_start = time.perf_counter()
         inner_indexes = create_inner_indexes(x_d, cluster_ids, cfg)
-        time_build_hnsw = time.perf_counter() - time_start
-        fprint(f'>> build hnsw index time: {time_build_hnsw}', fw)
+        time_build_flat = time.perf_counter() - time_start
+        fprint(f'>> build flat index time: {time_build_flat}', fw)
         search_time, cmp_distr_all, found_aknn_id = get_cmp_recall(inner_indexes, x_q, cluster_ids, cfg)
         # query process with different threshold, to get the curve of recall VS. computations
         query_tuning(all_outputs, knn_distr_id_query, found_aknn_id, cfg)
@@ -326,8 +340,8 @@ if __name__ == "__main__":
         # build inner indexes
         time_start = time.perf_counter()
         inner_indexes = create_inner_indexes(x_d, cluster_ids, cfg)
-        time_build_hnsw = time.perf_counter() - time_start
-        fprint(f'>> build hnsw index time: {time_build_hnsw}', fw)
+        time_build_flat = time.perf_counter() - time_start
+        fprint(f'>> build flat index time: {time_build_flat}', fw)
 
         time_start = time.perf_counter()
         search_time, cmp_distr_all, found_aknn_id = get_cmp_recall(inner_indexes, x_q, cluster_ids, cfg)

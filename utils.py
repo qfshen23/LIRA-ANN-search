@@ -1,17 +1,18 @@
 import sys
 import numpy as np
 import os
-import numpy as np
-import h5py
 import subprocess
 import re
 from sklearn.preprocessing import StandardScaler
+from scipy.spatial.distance import cdist
 import faiss
+faiss.omp_set_num_threads(1)
 import torch
 import pandas as pd
 from tqdm import tqdm
-import h5py
 import random
+import time
+
 np.random.seed(43)
 seed = 43
 np.random.seed(seed)
@@ -20,92 +21,72 @@ torch.cuda.manual_seed(seed)
 torch.cuda.manual_seed_all(seed)
 random.seed(seed)
 
-def mmap_fvecs(fname, dtype='float32'):
-    x = np.memmap(fname, dtype='int32', mode='r')
+def read_xvecs(file_path, dtype='float32'):
+    """
+    Read .xvecs format files (fvecs, ivecs, bvecs, etc.)
+    
+    Args:
+        file_path: path to the xvecs file
+        dtype: data type ('float32' for fvecs, 'int32' for ivecs, 'uint8' for bvecs)
+    
+    Returns:
+        numpy array of shape (n_vectors, dimension)
+    """
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"File not found: {file_path}")
+    
+    x = np.memmap(file_path, dtype='int32', mode='r')
     d = x[0]
     return x.view(dtype).reshape(-1, d + 1)[:, 1:]
 
-def read_ivecs(file_path):
-    with open(file_path, 'rb') as file:
-        raw_data = file.read()
-
-    data = np.frombuffer(raw_data, dtype=np.int32) # tranfer to int32
-    vectors = []
-    i = 0
-    while i < len(data):
-        dimension = data[i]  # the first integer is the dimension of the vector
-        i += 1
-        vectors.append(data[i:i+dimension])  # get the vector
-        i += dimension
-
-    return np.array(vectors)
-
-def norm_glove(arr):
-    '''
-    norm to 1
-    '''
-    norms = np.linalg.norm(arr, axis=1)
-    norm_arr = arr / norms[:, np.newaxis]
-    return norm_arr
-
-def load_data(DB_name):
-    '''
-    load dataset
-    '''
-    if DB_name == "gist":
-        DB_DIR = './dataset/gist/'
-        x_d = mmap_fvecs('{}gist_base.fvecs'.format(DB_DIR)) # data (1000000, 960)
-        x_q = mmap_fvecs('{}gist_query.fvecs'.format(DB_DIR)) # query (1000, 960)
-        xt = mmap_fvecs('{}gist_learn.fvecs'.format(DB_DIR)) # (500000, 960)
-        gt_ids = None
-    elif DB_name == "sift":
-        DB_DIR = './dataset/sift/'
-        x_d = mmap_fvecs('{}sift_base.fvecs'.format(DB_DIR)) # data (1000000, 128)
-        x_q = mmap_fvecs('{}sift_query.fvecs'.format(DB_DIR)) # query (10000, 128)
-        xt = mmap_fvecs('{}sift_learn.fvecs'.format(DB_DIR)) # (100000, 128)
-        gt_ids = read_ivecs('{}sift_groundtruth.ivecs'.format(DB_DIR))
-    elif DB_name == "glove":
-        DB_DIR = './dataset/glove-100-angular.hdf5'
-        dataset = h5py.File(DB_DIR, 'r')
-        xd_ori = np.array(dataset["train"]) # ndarray (1183514, 100)
-        xq_ori = np.array(dataset['test']) # (10000, 100)
-        gt_ids = np.array(dataset['neighbors']) # (10000, 100)
-        x_d = norm_glove(xd_ori) # np.linalg.norm(x_d[0]) = 1
-        x_q = norm_glove(xq_ori)
-        xt = None
-    elif DB_name == "bigann":
-        DB_DIR = './dataset/bigann/'
-        x_d = mmap_fvecs('{}bigann_base_50m.bvecs'.format(DB_DIR), dtype=np.uint8)
-        x_q = mmap_fvecs('{}bigann_query.bvecs'.format(DB_DIR), dtype=np.uint8) 
-        gt_ids = None
-        xt = None
-    elif DB_name == 'deep50M':
-        DB_DIR = './dataset/deep50M/'
-        # DB_DIR = '/data/cph/Project/balanced-multi-probe-ANN/dataset/deep50M/'
-        x_d = mmap_fvecs('{}deep_base_50m.fvecs'.format(DB_DIR)) # data (50M, 96)
-        x_q = mmap_fvecs('{}deep_query.fvecs'.format(DB_DIR)) # query (10000, 96)
-        gt_ids = None
-        xt = None
-    elif DB_name == 'text2image50M':
-        DB_DIR = './dataset/text2image/'
-        x_d = mmap_fvecs('{}text2image_base_50m.fvecs'.format(DB_DIR)) # data (50M, 200)
-        x_q = mmap_fvecs('{}text2image_query.fvecs'.format(DB_DIR)) # query (100000, 200)
-        gt_ids = None
-        xt = None
-    elif DB_name == 'deep100M':
-        DB_DIR = './dataset/deep100M/'
-        xd_ori = mmap_fvecs('{}deep_base_100m.fvecs'.format(DB_DIR)) # data (100M, 96)
-        xq_ori = mmap_fvecs('{}deep_query.fvecs'.format(DB_DIR)) # query (10000, 96)
-        x_d = norm_glove(xd_ori)
-        x_q = norm_glove(xq_ori)
-        gt_ids = None
-        xt = None
+def load_data(dataset_name, data_path='/data/vector_datasets'):
+    """
+    Load dataset using unified xvecs format
+    
+    Args:
+        dataset_name: name of the dataset (e.g., 'sift', 'spacev10m')
+        data_path: base path where datasets are stored
+    
+    Returns:
+        x_d: base vectors (numpy array)
+        x_q: query vectors (numpy array)
+        gt_ids: ground truth nearest neighbors (numpy array or None)
+    """
+    dataset_dir = os.path.join(data_path, dataset_name)
+    
+    dtype = 'float32'
+    ext = 'fvecs'
+    
+    # Load base vectors
+    base_file = os.path.join(dataset_dir, f'{dataset_name}_base.{ext}')
+    if not os.path.exists(base_file):
+        # Try alternative naming: some datasets might use different suffixes
+        base_file = os.path.join(dataset_dir, f'{dataset_name}_learn.{ext}')
+    
+    x_d = read_xvecs(base_file, dtype=dtype)
+    
+    # Load query vectors
+    query_file = os.path.join(dataset_dir, f'{dataset_name}_query.{ext}')
+    x_q = read_xvecs(query_file, dtype=dtype)
+    
+    # Load ground truth if exists
+    gt_file = os.path.join(dataset_dir, f'{dataset_name}_groundtruth.ivecs')
+    if os.path.exists(gt_file):
+        gt_ids = read_xvecs(gt_file, dtype='int32')
     else:
-        print("unknown dataset")
-    # for faiss1.5.2
-    x_q = np.ascontiguousarray(x_q)
+        gt_ids = None
+    
+    # Ensure contiguous arrays for faiss
     x_d = np.ascontiguousarray(x_d)
-    return x_d, x_q, xt, gt_ids
+    x_q = np.ascontiguousarray(x_q)
+    
+    print(f"Loaded dataset '{dataset_name}':")
+    print(f"  Base vectors: {x_d.shape}")
+    print(f"  Query vectors: {x_q.shape}")
+    if gt_ids is not None:
+        print(f"  Ground truth: {gt_ids.shape}")
+    
+    return x_d, x_q, gt_ids
 
 def get_idle_gpu():
     # get GPU status
@@ -116,34 +97,102 @@ def get_idle_gpu():
     return idle_gpu_index
 
 def get_dist_cid(data, kmeans, n_bkt):
-    # batch distance calculation
-    batch_size = 512
+    """
+    批量计算数据点到聚类中心的距离
+    使用 scipy.spatial.distance.cdist 优化内存和速度
+    """
+    # 使用更大的批量大小以提高效率
+    batch_size = 10000
     n_samples = data.shape[0]
     n_centroids = kmeans.centroids.shape[0]
+    
+    # 预分配结果数组
     distances = np.zeros((n_samples, n_centroids), dtype=np.float32)
     
     for start_idx in range(0, n_samples, batch_size):
         end_idx = min(start_idx + batch_size, n_samples)
         data_batch = data[start_idx:end_idx]
-        distances_batch = np.linalg.norm(data_batch[:, None] - kmeans.centroids, axis=2)
+        # 使用 cdist 计算欧氏距离，比 broadcasting 更节省内存
+        distances_batch = cdist(data_batch, kmeans.centroids, metric='euclidean').astype(np.float32)
         distances[start_idx:end_idx] = distances_batch
 
     return distances
 
 def get_scaled_dist(x_d, x_q, kmeans, n_bkt):
-    distances_data = get_dist_cid(x_d, kmeans, n_bkt)
-    distances_query = get_dist_cid(x_q, kmeans, n_bkt)
-    scaler = StandardScaler()
-    distances_data_scaled = scaler.fit_transform(distances_data)
-    distances_query_scaled = scaler.transform(distances_query)
+    n_d = x_d.shape[0]
+    n_q = x_q.shape[0]
 
+    if n_d < 1_000_000:
+        distances_data = get_dist_cid(x_d, kmeans, n_bkt).astype(np.float32)
+        distances_query = get_dist_cid(x_q, kmeans, n_bkt).astype(np.float32)
+        scaler = StandardScaler()
+        distances_data_scaled = scaler.fit_transform(distances_data).astype(np.float16)   # <- 改为 f16
+        distances_query_scaled = scaler.transform(distances_query).astype(np.float16)     # <- 改为 f16
+        return distances_data_scaled, distances_query_scaled
+
+    # 大数据集：两遍法 + memmap(f16)
+    print(f">> 计算距离（数据集大小: {n_d}, 使用增量方式）...")
+    batch_size = 10000
+    scaler = StandardScaler()
+
+    # pass1: partial_fit
+    for start_idx in range(0, n_d, batch_size):
+        end_idx = min(start_idx + batch_size, n_d)
+        distances_batch = get_dist_cid(x_d[start_idx:end_idx], kmeans, n_bkt).astype(np.float32)
+        scaler.partial_fit(distances_batch)
+        del distances_batch
+
+    # pass2: transform + 写入 memmap(float16)
+    os.makedirs('/tmp/lira_cache', exist_ok=True)
+    mm_path = '/tmp/lira_cache/distances_data_scaled.f16.memmap'
+    distances_data_scaled = np.memmap(mm_path, dtype='float16', mode='w+', shape=(n_d, n_bkt))  # <- memmap
+
+    for start_idx in range(0, n_d, batch_size):
+        end_idx = min(start_idx + batch_size, n_d)
+        distances_batch = get_dist_cid(x_d[start_idx:end_idx], kmeans, n_bkt).astype(np.float32)
+        distances_data_scaled[start_idx:end_idx] = scaler.transform(distances_batch).astype(np.float16)  # <- f16
+        del distances_batch
+
+    # 查询集一次性处理，也转 f16（通常较小）
+    distances_query = get_dist_cid(x_q, kmeans, n_bkt).astype(np.float32)
+    distances_query_scaled = scaler.transform(distances_query).astype(np.float16)
+
+    # 注意：返回的是 memmap（行为与 ndarray 一致），后续可直接 torch.tensor(...)
     return distances_data_scaled, distances_query_scaled
 
 def get_scaled_dist_data(x_d, kmeans, n_bkt):
-    distances_data = get_dist_cid(x_d, kmeans, n_bkt)
+    """
+    只计算并标准化数据到聚类中心的距离
+    对于大数据集，使用批量处理以节省内存
+    """
+    n_d = x_d.shape[0]
+    
+    # 如果数据集较小（<50万），直接计算
+    if n_d < 500000:
+        distances_data = get_dist_cid(x_d, kmeans, n_bkt)
+        scaler = StandardScaler()
+        distances_data_scaled = scaler.fit_transform(distances_data)
+        return distances_data_scaled
+    
+    # 对于大数据集，使用增量方式
+    batch_size = 50000
     scaler = StandardScaler()
-    distances_data_scaled = scaler.fit_transform(distances_data)
-
+    
+    # 第一遍：fit scaler
+    for start_idx in range(0, n_d, batch_size):
+        end_idx = min(start_idx + batch_size, n_d)
+        distances_batch = get_dist_cid(x_d[start_idx:end_idx], kmeans, n_bkt)
+        scaler.partial_fit(distances_batch)
+        del distances_batch
+    
+    # 第二遍：transform
+    distances_data_scaled = np.zeros((n_d, n_bkt), dtype=np.float32)
+    for start_idx in range(0, n_d, batch_size):
+        end_idx = min(start_idx + batch_size, n_d)
+        distances_batch = get_dist_cid(x_d[start_idx:end_idx], kmeans, n_bkt)
+        distances_data_scaled[start_idx:end_idx] = scaler.transform(distances_batch).astype(np.float32)
+        del distances_batch
+    
     return distances_data_scaled
 
 def fprint(message, file=None):
@@ -152,23 +201,103 @@ def fprint(message, file=None):
         print(message, file=file)  # print to file
 
 
-def get_flat_GT_knn(x_data, x_query, cfg, datatype="query"):
+def compute_data_knn(x_data, cfg, data_path='/data/vector_datasets'):
     '''
-    get the top-k knn of query or data on the dataset with len(x_data)
-    x_data can be a subset of the whole dataset
+    Load or compute KNN of data on itself (for training data)
+    
+    Priority:
+      1. Load from C++ precomputed cache (.bin file) - RECOMMENDED
+      2. Load from Python cache (.npy file)
+      3. Compute using simple FLAT index (slow, not recommended for large datasets)
+    
+    Args:
+        x_data: data vectors
+        cfg: configuration object
+        data_path: base path for datasets
     '''
-    pth_query_knn = f'./dataset/{cfg.dataset}/{cfg.dataset}-xd{len(x_data)}_{datatype}_knn{cfg.k}.npy'
-    if not os.path.exists(pth_query_knn):
-        dim = x_data.shape[1]
-        index_flat = faiss.IndexFlatL2(dim)
-        index_flat.add(x_data)
-        _, knn_query = index_flat.search(x_query, cfg.k)
-        np.save(pth_query_knn, knn_query)
+    # Create cache directory if not exists
+    cache_dir = os.path.join(data_path, cfg.dataset, 'knn_cache')
+    os.makedirs(cache_dir, exist_ok=True)
+    
+    n_data = len(x_data)
+    
+    # Try to load from C++ precomputed cache first (.bin format)
+    # Try IVF approximate cache first (faster to compute), then exact cache
+    cache_patterns = [
+        f'{cfg.dataset}-data_self_knn{cfg.k}-n{n_data}_ivf_nprobe*.bin',  # IVF with any nprobe
+        f'{cfg.dataset}-data_self_knn{cfg.k}-n{n_data}.bin',              # Exact search
+    ]
+    
+    cache_file_bin = None
+    for pattern in cache_patterns:
+        import glob
+        matches = glob.glob(os.path.join(cache_dir, pattern))
+        if matches:
+            # Use the most recently created file
+            cache_file_bin = max(matches, key=os.path.getctime)
+            break
+    
+    cache_file_npy = os.path.join(cache_dir, f'{cfg.dataset}-data_self_knn{cfg.k}-n{n_data}.npy')
+    
+    # Check for C++ generated .bin file first (RECOMMENDED)
+    if cache_file_bin and os.path.exists(cache_file_bin):
+        print(f"✓ Loading precomputed KNN from C++ cache: {os.path.basename(cache_file_bin)}")
+        knn_data = np.fromfile(cache_file_bin, dtype=np.int32).reshape(n_data, cfg.k)
+        print(f"✓ Loaded KNN with shape: {knn_data.shape}")
+        return knn_data
+    
+    # Check for Python generated .npy file
+    if os.path.exists(cache_file_npy):
+        print(f"✓ Loading cached KNN from: {cache_file_npy}")
+        knn_data = np.load(cache_file_npy).astype(int)
+        return knn_data
+    
+    # No cache found - compute using Python (slow, not recommended)
+    print(f"\n{'='*60}")
+    print(f"WARNING: No precomputed KNN cache found!")
+    print(f"{'='*60}")
+    print(f"Computing KNN in Python is SLOW for large datasets.")
+    print(f"Recommendation: Use C++ program for faster computation:")
+    print(f"  # Fast approximate search (recommended):")
+    print(f"  ./compute_knn {cfg.dataset} {data_path} {cfg.k} 64 24")
+    print(f"  # Or exact search (slower):")
+    print(f"  ./compute_knn {cfg.dataset} {data_path} {cfg.k} 0 24")
+    print(f"{'='*60}\n")
+    
+    dim = x_data.shape[1]
+    print(f"Computing data self-KNN for {n_data} vectors (dim={dim})...")
+    print(f"This may take a while... Please wait or interrupt and use C++ program.")
+    
+    t_start = time.time()
+    
+    # Simple FLAT index (exact search)
+    if cfg.dis_metric == 'inner_product':
+        index = faiss.IndexFlatIP(dim)
     else:
-        knn_query = np.load(pth_query_knn)
-        knn_query = knn_query.astype(int) # will be loaded as float
-
-    return knn_query
+        index = faiss.IndexFlatL2(dim)
+    
+    index.add(x_data)
+    
+    # Search in batches to avoid memory issues
+    batch_size = min(10000, n_data)
+    knn_data = np.zeros((n_data, cfg.k), dtype=np.int32)
+    
+    print(f"Searching in batches of {batch_size}...")
+    for start_idx in tqdm(range(0, n_data, batch_size), desc="Computing KNN"):
+        end_idx = min(start_idx + batch_size, n_data)
+        batch = x_data[start_idx:end_idx]
+        _, batch_knn = index.search(batch, cfg.k + 1)  # +1 to exclude self
+        # Remove self (first neighbor is usually itself)
+        knn_data[start_idx:end_idx] = batch_knn[:, 1:cfg.k+1]
+    
+    t_elapsed = time.time() - t_start
+    print(f"KNN computation completed in {t_elapsed:.2f}s")
+    
+    # Save to cache
+    np.save(cache_file_npy, knn_data)
+    print(f"✓ Cached to: {cache_file_npy}")
+    
+    return knn_data
 
 def build_kmeans_index(x_data, n_bkt):
     n_d, dim = x_data.shape
@@ -230,22 +359,6 @@ def get_knn_distr_redundancy(knn, data_2_bkt, cfg):
     
     return knn_distr_cnt, knn_distr_id
 
-def create_hnsw_indexes(x_d, xd_id_bkts, cfg, dis_metric: str = 'L2'):
-    """
-    create a hnsw index for each bucket
-    """
-    hnsw_indexes = []
-    for i in range(cfg.n_bkt):
-        xd_id_bkt = np.array(xd_id_bkts[i])
-        xd_bkt = x_d[xd_id_bkt]
-        hnsw_index = faiss.IndexHNSWFlat(xd_bkt.shape[1], cfg.hnsw_M)
-        if dis_metric == 'inner_product':
-            hnsw_index.metric_type = faiss.METRIC_INNER_PRODUCT
-        hnsw_index.add(xd_bkt)
-        hnsw_indexes.append(hnsw_index)
-
-    return hnsw_indexes
-
 def create_flat_indexes(x_d, xd_id_bkts, cfg, dis_metric: str = 'L2'):
     """
     create a flat index for each bucket
@@ -264,10 +377,10 @@ def create_flat_indexes(x_d, xd_id_bkts, cfg, dis_metric: str = 'L2'):
     return flat_indexes
 
 def create_inner_indexes(x_d, cluster_ids, cfg):
-    if cfg.inner_index_type == 'FLAT':
-        inner_indexes = create_flat_indexes(x_d, cluster_ids, cfg)
-    elif cfg.inner_index_type == 'HNSW':
-        inner_indexes = create_hnsw_indexes(x_d, cluster_ids, cfg)
+    """
+    create FLAT indexes for each bucket
+    """
+    inner_indexes = create_flat_indexes(x_d, cluster_ids, cfg, dis_metric=cfg.dis_metric)
     return inner_indexes
 
 def min_exclude_zero(row):
