@@ -69,7 +69,7 @@ class Config:
             print(f"警告: 未知的 metric 值 '{self.dis_metric}'，将使用原始值。支持的值: 'L2', 'inner_product'")
         
         # 动态生成日志路径和文件名（包含 metric 信息）
-        self.pth_log = f'./logs/{self.dataset}/ML_kmeans_RE_FLAT/'
+        self.pth_log = f'/data/tmp/lira/{self.dataset}/ML_kmeans_RE_FLAT/'
         self.file_name = f'{self.dataset}-k={self.k}-ML_kmeans={self.n_bkt}_FLAT_Metric={self.dis_metric}_ReType={self.duplicate_type}_ReRatio={self.redundancy_ratio}'
         self.log_name = f'{self.file_name}.txt'
         self.df_name = f'{self.file_name}.csv'
@@ -141,104 +141,55 @@ def cal_metrics(all_predicts, all_targets, epoch, knn_distr_id, cluster_id, resu
 
     return results_df
 
-
-def get_cmp_recall(inner_indexes, x_q, xd_id_bkt, cfg):
+def save_index_artifacts(cfg, kmeans, data_2_bkt, x_d, model, device, fw):
     """
-    search in each partition for each query
-    return the search time, distance comparisons, and found aknn id (which need to be deduplicated later)
+    将 index + 模型相关的内容导出到磁盘，供 C++ search 使用。
+    保存内容：
+      - centroids.npy           : kmeans.centroids (float32)
+      - data_2_bkt.npy         : (N, n_mul) cluster assignment（含冗余，-1 表示无）
+      - x_d.npy                : base vectors (可选，看你 C++ 怎么读数据)
+      - redundant_flags.npy    : 哪些点被冗余（可选）
+      - mlp_2_input.pt         : TorchScript 模型 (LibTorch 可直接加载)
+
+    注：StandardScaler 的 mean / scale 建议在 get_scaled_dist 里另外保存：
+      - scaler_mean.npy
+      - scaler_scale.npy
     """
-    n_bkt = cfg.n_bkt
-    n_q = len(x_q)
-    search_time = np.zeros((n_q, n_bkt))  # record the search time
-    cmp_distr_all = np.zeros((n_q, n_bkt), dtype=int)  # record the distance comparisons
-    found_aknn_id = np.full((n_q, n_bkt, cfg.k), -1)  # record the found aknn id
-    xd_id_bkt_int = [np.array(bkt).astype(int) for bkt in xd_id_bkt]
-    
-    # loop for each bucket
-    for b_id in tqdm(range(n_bkt)): 
-        inner_index = inner_indexes[b_id]
-        xd_id_bid = xd_id_bkt_int[b_id] # the data id in the current bucket
-        if inner_index is None or len(xd_id_bkt_int[b_id]) == 0:
-            continue
-        
-        # loop for each query
-        for q_id in range(n_q):
-            q = x_q[q_id].reshape(1, -1)
-            t_start = time.time()
-            _, idx_in_bkt = inner_index.search(q, cfg.k)
-            aknn_id = xd_id_bid[idx_in_bkt.reshape(-1)]
-            found_aknn_id[q_id][b_id] = aknn_id
-            cmp_distr_all[q_id][b_id] = inner_index.ntotal
-            search_time[q_id][b_id] = time.time() - t_start
+    out_dir = cfg.pth_log
+    os.makedirs(out_dir, exist_ok=True)
 
-    return search_time, cmp_distr_all, found_aknn_id
+    # 1. centroids
+    centroids = kmeans.centroids.astype(np.float32)
+    np.save(os.path.join(out_dir, f"{cfg.file_name}_centroids.npy"), centroids)
 
-def query_tuning(all_outputs, knn_distr_id, found_aknn_id, search_time, cmp_distr_all, cfg, fw, part=0):
-    n_q = len(all_outputs)
-    n_s = n_q
-    
-    pd_cols = ['threshold', 'nprobe', 'Recall', 'Computations', 'QPS']
-    df_threshold = pd.DataFrame(columns=pd_cols)
-    
-    # 创建目录
-    os.makedirs(cfg.pth_log + cfg.file_name + f'_tuning_threshold/', exist_ok=True)
-    
-    # 写入标题到主日志
-    fprint("", fw)
-    fprint("=" * 90, fw)
-    fprint(f"Query Tuning Results - Part {part}", fw)
-    fprint("=" * 90, fw)
-    fprint(f"Dataset: {cfg.dataset}, n_bkt: {cfg.n_bkt}, metric: {cfg.dis_metric}, redundancy_ratio: {cfg.redundancy_ratio}", fw)
-    fprint(f"Number of queries: {n_q}", fw)
-    fprint("=" * 90, fw)
-    
-    # 创建表格
-    table = PrettyTable(['Threshold', 'nprobe', 'Recall', 'Computations', 'QPS'])
-    table.float_format = "4.4"
-    
-    for threshold in np.arange(0.02, 0.82, 0.02):
-        thre_recall = np.zeros(n_s)
-        thre_cmp = np.zeros(n_s)
-        thre_nprobe = np.zeros(n_s)
-        thre_time = np.zeros(n_s)  # 每个查询的搜索时间
-        for i in range(n_s):
-            # get the bucket with probing probability > threshold
-            top_m_indices = np.where(all_outputs[i] > threshold)[0]
-            thre_nprobe[i] = len(top_m_indices)
-            thre_cmp[i] = np.sum(cmp_distr_all[i, top_m_indices])
-            thre_time[i] = np.sum(search_time[i, top_m_indices])  # 累加该查询在各分区的搜索时间
-            found_knn = set()
-            for q_c in top_m_indices:
-                aknn_c = set(knn_distr_id[i][q_c]).intersection(found_aknn_id[i][q_c])
-                found_knn.update(aknn_c)
-            thre_recall[i] = len(found_knn) / cfg.k
+    # 2. data_2_bkt（含冗余）
+    np.save(os.path.join(out_dir, f"{cfg.file_name}_data_2_bkt.npy"),
+            data_2_bkt.astype(np.int32))
 
-        thre_recall_avg = np.mean(thre_recall)
-        thre_cmp_avg = np.mean(thre_cmp)
-        thre_nprobe_avg = np.mean(thre_nprobe)
-        thre_time_avg = np.mean(thre_time)  # 平均查询时间
-        thre_qps = 1.0 / thre_time_avg if thre_time_avg > 0 else 0.0  # QPS = 1 / 平均查询时间
-        
-        # 打印到控制台
-        print(f'threshold: {threshold:.3f}, nprobe: {thre_nprobe_avg:.2f}, Recall: {thre_recall_avg:.4f}, Computations: {thre_cmp_avg:.0f}, QPS: {thre_qps:.2f}')
-        
-        # 添加到表格
-        table.add_row([threshold, thre_nprobe_avg, thre_recall_avg, thre_cmp_avg, thre_qps])
-        
-        # 保存到 DataFrame
-        new_data = pd.DataFrame([{'threshold': threshold, 'nprobe': thre_nprobe_avg, 'Recall': thre_recall_avg, 'Computations': thre_cmp_avg, 'QPS': thre_qps}])
-        df_threshold = pd.concat([df_threshold, new_data], ignore_index=True)
-    
-    # 写入表格到主日志文件
-    fprint(table, fw)
-    fprint("=" * 90, fw)
-    fprint("", fw)
-    
-    # 保存 CSV
-    csv_path = cfg.pth_log + cfg.file_name + f'_tuning_threshold/{cfg.duplicate_type}_{part}.csv'
-    df_threshold.to_csv(csv_path, index=False)
-    
-    fprint(f">> Query tuning CSV saved to: {csv_path}", fw)
+    # 3. base vectors（可选，方便 C++ 用）
+    np.save(os.path.join(out_dir, f"{cfg.file_name}_x_d.npy"),
+            x_d.astype(np.float32))
+
+    # 4. 冗余标记（可选）
+    #   规则：只要该点在第 1 列以外还有有效 bucket（!= -1），就认为它是冗余点
+    redundant_flags = (data_2_bkt[:, 1:] != -1).any(axis=1).astype(np.uint8)
+    np.save(os.path.join(out_dir, f"{cfg.file_name}_redundant_flags.npy"),
+            redundant_flags)
+
+    # 5. 导出 TorchScript 模型
+    model_cpu = model.to('cpu')
+    model_cpu.eval()
+    scripted_model = torch.jit.script(model_cpu)
+    torchscript_path = os.path.join(out_dir, f"{cfg.file_name}_mlp_2_input.pt")
+    torch.jit.save(scripted_model, torchscript_path)
+    # example_dist = torch.randn(1, cfg.n_bkt, device='cpu')
+    # example_vec = torch.randn(1, x_d.shape[1], device='cpu')
+    # with torch.no_grad():
+    #     scripted = torch.jit.trace(model_cpu, (example_dist, example_vec))
+    # torchscript_path = os.path.join(out_dir, f"{cfg.file_name}_mlp_2_input.pt")
+    # scripted.save(torchscript_path)
+
+    fprint(f">> [Index] centroids / data_2_bkt / x_d / redundant_flags / mlp_2_input.pt 已保存到 {out_dir}", fw)
 
 # ============================================================================================
 # ============================================================================================
@@ -330,49 +281,39 @@ if __name__ == "__main__":
 
     # (4) redundancy with probing model
     fprint(f">> begin redundancy with {cfg.duplicate_type}, metric: {cfg.dis_metric}", fw)
+        # (4) redundancy with probing model
+    fprint(f">> begin redundancy with {cfg.duplicate_type}, metric: {cfg.dis_metric}", fw)
     if cfg.duplicate_type == 'model':
-        # 使用模型评估所有数据点
+        # 使用模型评估所有数据点（保持原有逻辑）
         _, data_predicts, _, data_partition_score = model_evaluate(model, train_loader, criterion, device)
         nprobe_predicts = torch.sum(data_predicts, axis=1)
         xd_id_sorted_pre = torch.argsort(nprobe_predicts, descending=True)
         
         # 计算需要冗余的数据点数量（前 redundancy_ratio % 的数据）
-        n_d = len(data_predicts)
-        n_redundancy = int(n_d * cfg.redundancy_ratio)
-        fprint(f">> 冗余比例: {cfg.redundancy_ratio * 100:.1f}%, 冗余向量数: {n_redundancy}/{n_d}", fw)
-        
-        # 先测试无冗余的基准性能
-        fprint(">> 测试基准性能（无冗余）...", fw)
-        inner_indexes = create_inner_indexes(x_d, cluster_ids, cfg)
-        search_time, cmp_distr_all, found_aknn_id = get_cmp_recall(inner_indexes, x_q, cluster_ids, cfg)
-        query_tuning(all_outputs, knn_distr_id_query, found_aknn_id, search_time, cmp_distr_all, cfg, fw, part=0)
+        n_d_model = len(data_predicts)
+        n_redundancy = int(n_d_model * cfg.redundancy_ratio)
+        fprint(f">> 冗余比例: {cfg.redundancy_ratio * 100:.1f}%, 冗余向量数: {n_redundancy}/{n_d_model}", fw)
         
         # 一次性对前 x% 的数据进行冗余分配
         fprint(f">> 开始对前 {cfg.redundancy_ratio * 100:.1f}% 的向量进行冗余分配...", fw)
-        mul_partition_by_model(data_partition_score, data_predicts, xd_id_sorted_pre, 
-                              data_2_bkt, cluster_cnts, cluster_ids, 
-                              begin=0, end=n_redundancy)
-        
-        # 更新 KNN 分布
-        knn_distr_cnt_query, knn_distr_id_query = get_knn_distr_redundancy(knn_query, data_2_bkt, cfg)
-        
-        # 重建索引并测试性能
-        fprint(f">> 测试冗余后性能（冗余了 {n_redundancy} 个向量）...", fw)
-        inner_indexes = create_inner_indexes(x_d, cluster_ids, cfg)
-        search_time, cmp_distr_all, found_aknn_id = get_cmp_recall(inner_indexes, x_q, cluster_ids, cfg)
-        query_tuning(all_outputs, knn_distr_id_query, found_aknn_id, search_time, cmp_distr_all, cfg, fw, part=1)
-    elif cfg.duplicate_type == 'None':
-        # build inner indexes
-        time_start = time.perf_counter()
-        inner_indexes = create_inner_indexes(x_d, cluster_ids, cfg)
-        time_build_flat = time.perf_counter() - time_start
-        fprint(f'>> build flat index time: {time_build_flat}', fw)
+        mul_partition_by_model(
+            data_partition_score, data_predicts, xd_id_sorted_pre,
+            data_2_bkt, cluster_cnts, cluster_ids,
+            begin=0, end=n_redundancy
+        )
 
-        time_start = time.perf_counter()
-        search_time, cmp_distr_all, found_aknn_id = get_cmp_recall(inner_indexes, x_q, cluster_ids, cfg)
-        time_search = time.perf_counter() - time_start
-        fprint(f'>> search time: {time_search}', fw)
-        query_tuning(all_outputs, knn_distr_id_query, found_aknn_id, search_time, cmp_distr_all, cfg, fw)
+        # 此时 data_2_bkt / cluster_ids 已经包含冗余信息
+        # 不在 Python 里做 search / query_tuning，交给 C++ 实现
+        fprint(">> 冗余分配完成（Python 端只负责建 index，不做 search）", fw)
+
+        # 保存 index + 模型到磁盘，供 C++ 使用
+        save_index_artifacts(cfg, kmeans, data_2_bkt, x_d, model, device, fw)
+
+    elif cfg.duplicate_type == 'None':
+        # 不做任何冗余，直接保存 index + 模型
+        fprint(">> 不进行冗余（duplicate_type == 'None'），保存原始单分区 index", fw)
+        save_index_artifacts(cfg, kmeans, data_2_bkt, x_d, model, device, fw)
+
 
     fprint("finish!", fw)
     results_df.to_csv(cfg.pth_log + cfg.df_name, index=False)  # Save DataFrame to CSV

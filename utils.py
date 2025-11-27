@@ -6,7 +6,7 @@ import re
 from sklearn.preprocessing import StandardScaler
 from scipy.spatial.distance import cdist
 import faiss
-faiss.omp_set_num_threads(1)
+faiss.omp_set_num_threads(32)
 import torch
 import pandas as pd
 from tqdm import tqdm
@@ -117,46 +117,66 @@ def get_dist_cid(data, kmeans, n_bkt):
 
     return distances
 
-def get_scaled_dist(x_d, x_q, kmeans, n_bkt):
+def get_scaled_dist(x_d, x_q, kmeans, n_bkt, cfg):
+    """
+    计算 data / query 到所有聚类中心的距离，并进行 StandardScaler 标准化。
+    同时将 StandardScaler 的参数 mean_ / scale_ 保存到磁盘，供 C++ 端复用。
+
+    返回:
+        distances_data_scaled : (n_d, n_bkt), float32
+        distances_query_scaled: (n_q, n_bkt), float32
+    """
     n_d = x_d.shape[0]
     n_q = x_q.shape[0]
 
+    # ------- 1) 小数据集：一次性算完 -------
     if n_d < 1_000_000:
+        # data -> centroids 距离
         distances_data = get_dist_cid(x_d, kmeans, n_bkt).astype(np.float32)
+        # query -> centroids 距离
         distances_query = get_dist_cid(x_q, kmeans, n_bkt).astype(np.float32)
+
+        # StandardScaler
         scaler = StandardScaler()
-        distances_data_scaled = scaler.fit_transform(distances_data).astype(np.float16)   # <- 改为 f16
-        distances_query_scaled = scaler.transform(distances_query).astype(np.float16)     # <- 改为 f16
-        return distances_data_scaled, distances_query_scaled
+        distances_data_scaled = scaler.fit_transform(distances_data).astype(np.float32)
+        distances_query_scaled = scaler.transform(distances_query).astype(np.float32)
 
-    # 大数据集：两遍法 + memmap(f16)
-    print(f">> 计算距离（数据集大小: {n_d}, 使用增量方式）...")
-    batch_size = 10000
-    scaler = StandardScaler()
+    # ------- 2) 大数据集：两遍法 + partial_fit -------
+    else:
+        print(f">> [get_scaled_dist] n_d = {n_d}, 使用增量方式进行标准化")
+        batch_size = 10000
+        scaler = StandardScaler()
 
-    # pass1: partial_fit
-    for start_idx in range(0, n_d, batch_size):
-        end_idx = min(start_idx + batch_size, n_d)
-        distances_batch = get_dist_cid(x_d[start_idx:end_idx], kmeans, n_bkt).astype(np.float32)
-        scaler.partial_fit(distances_batch)
-        del distances_batch
+        # 第一遍：partial_fit 估计 mean / var
+        for start_idx in range(0, n_d, batch_size):
+            end_idx = min(start_idx + batch_size, n_d)
+            distances_batch = get_dist_cid(x_d[start_idx:end_idx], kmeans, n_bkt).astype(np.float32)
+            scaler.partial_fit(distances_batch)
+            del distances_batch
 
-    # pass2: transform + 写入 memmap(float16)
-    os.makedirs('/tmp/lira_cache', exist_ok=True)
-    mm_path = '/tmp/lira_cache/distances_data_scaled.f16.memmap'
-    distances_data_scaled = np.memmap(mm_path, dtype='float16', mode='w+', shape=(n_d, n_bkt))  # <- memmap
+        # 第二遍：transform data
+        distances_data_scaled = np.zeros((n_d, n_bkt), dtype=np.float32)
+        for start_idx in range(0, n_d, batch_size):
+            end_idx = min(start_idx + batch_size, n_d)
+            distances_batch = get_dist_cid(x_d[start_idx:end_idx], kmeans, n_bkt).astype(np.float32)
+            distances_data_scaled[start_idx:end_idx] = scaler.transform(distances_batch).astype(np.float32)
+            del distances_batch
 
-    for start_idx in range(0, n_d, batch_size):
-        end_idx = min(start_idx + batch_size, n_d)
-        distances_batch = get_dist_cid(x_d[start_idx:end_idx], kmeans, n_bkt).astype(np.float32)
-        distances_data_scaled[start_idx:end_idx] = scaler.transform(distances_batch).astype(np.float16)  # <- f16
-        del distances_batch
+        # query 一般较小，可以一次性算
+        distances_query = get_dist_cid(x_q, kmeans, n_bkt).astype(np.float32)
+        distances_query_scaled = scaler.transform(distances_query).astype(np.float32)
+        del distances_query
 
-    # 查询集一次性处理，也转 f16（通常较小）
-    distances_query = get_dist_cid(x_q, kmeans, n_bkt).astype(np.float32)
-    distances_query_scaled = scaler.transform(distances_query).astype(np.float16)
+    # ------- 3) 保存 StandardScaler 参数，供 C++ 端复现 -------
+    os.makedirs(cfg.pth_log, exist_ok=True)
+    mean_path  = os.path.join(cfg.pth_log, f"{cfg.file_name}_scaler_mean.npy")
+    scale_path = os.path.join(cfg.pth_log, f"{cfg.file_name}_scaler_scale.npy")
+    np.save(mean_path,  scaler.mean_.astype(np.float32))
+    np.save(scale_path, scaler.scale_.astype(np.float32))
 
-    # 注意：返回的是 memmap（行为与 ndarray 一致），后续可直接 torch.tensor(...)
+    print(f">> [get_scaled_dist] 保存 StandardScaler 参数: "
+           f"mean -> {mean_path}, scale -> {scale_path}")
+
     return distances_data_scaled, distances_query_scaled
 
 def get_scaled_dist_data(x_d, kmeans, n_bkt):
