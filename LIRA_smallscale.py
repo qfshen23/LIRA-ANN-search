@@ -54,12 +54,23 @@ class Config:
         if self.n_bkt is None:
             raise ValueError("参数 --n_bkt 是必需的！例如: --n_bkt 64")
         
-        if self.dis_metric == None:
+        # 验证并标准化 metric 参数
+        if self.dis_metric is None or self.dis_metric == '':
             self.dis_metric = 'L2'  # default to L2 distance
         
-        # 动态生成日志路径和文件名
+        # 标准化 metric 名称（支持多种输入格式）
+        metric_lower = self.dis_metric.lower()
+        if metric_lower in ['l2', 'euclidean', 'euclidean_distance']:
+            self.dis_metric = 'L2'
+        elif metric_lower in ['ip', 'inner_product', 'dot', 'dot_product']:
+            self.dis_metric = 'inner_product'
+        else:
+            # 保持用户输入的原始值，但给出警告
+            print(f"警告: 未知的 metric 值 '{self.dis_metric}'，将使用原始值。支持的值: 'L2', 'inner_product'")
+        
+        # 动态生成日志路径和文件名（包含 metric 信息）
         self.pth_log = f'./logs/{self.dataset}/ML_kmeans_RE_FLAT/'
-        self.file_name = f'{self.dataset}-k={self.k}-ML_kmeans={self.n_bkt}_FLAT_ReType={self.duplicate_type}_ReRatio={self.redundancy_ratio}'
+        self.file_name = f'{self.dataset}-k={self.k}-ML_kmeans={self.n_bkt}_FLAT_Metric={self.dis_metric}_ReType={self.duplicate_type}_ReRatio={self.redundancy_ratio}'
         self.log_name = f'{self.file_name}.txt'
         self.df_name = f'{self.file_name}.csv'
     
@@ -162,7 +173,7 @@ def get_cmp_recall(inner_indexes, x_q, xd_id_bkt, cfg):
 
     return search_time, cmp_distr_all, found_aknn_id
 
-def query_tuning(all_outputs, knn_distr_id, found_aknn_id, search_time, cfg, fw, part=0):
+def query_tuning(all_outputs, knn_distr_id, found_aknn_id, search_time, cmp_distr_all, cfg, fw, part=0):
     n_q = len(all_outputs)
     n_s = n_q
     
@@ -177,7 +188,7 @@ def query_tuning(all_outputs, knn_distr_id, found_aknn_id, search_time, cfg, fw,
     fprint("=" * 90, fw)
     fprint(f"Query Tuning Results - Part {part}", fw)
     fprint("=" * 90, fw)
-    fprint(f"Dataset: {cfg.dataset}, n_bkt: {cfg.n_bkt}, redundancy_ratio: {cfg.redundancy_ratio}", fw)
+    fprint(f"Dataset: {cfg.dataset}, n_bkt: {cfg.n_bkt}, metric: {cfg.dis_metric}, redundancy_ratio: {cfg.redundancy_ratio}", fw)
     fprint(f"Number of queries: {n_q}", fw)
     fprint("=" * 90, fw)
     
@@ -185,7 +196,7 @@ def query_tuning(all_outputs, knn_distr_id, found_aknn_id, search_time, cfg, fw,
     table = PrettyTable(['Threshold', 'nprobe', 'Recall', 'Computations', 'QPS'])
     table.float_format = "4.4"
     
-    for threshold in np.arange(0.1, 1.0, 0.02):
+    for threshold in np.arange(0.02, 0.82, 0.02):
         thre_recall = np.zeros(n_s)
         thre_cmp = np.zeros(n_s)
         thre_nprobe = np.zeros(n_s)
@@ -246,11 +257,12 @@ if __name__ == "__main__":
     if gt_ids is None:
         raise ValueError(f"Ground truth file not found for dataset {cfg.dataset}. Please ensure {cfg.dataset}_groundtruth.ivecs exists.")
     
-    fprint(f">> dataset: {cfg.dataset}, data_sizes: {x_d.shape}, query_size: {x_q.shape}, n_bkt: {n_bkt}, knn: {cfg.k}, num_threads: {num_threads}", fw)
+    fprint(f">> dataset: {cfg.dataset}, data_sizes: {x_d.shape}, query_size: {x_q.shape}, n_bkt: {n_bkt}, knn: {cfg.k}, metric: {cfg.dis_metric}, num_threads: {num_threads}", fw)
     n_d, dim = x_d.shape
     n_q, dim = x_q.shape
     device = f"cuda:{get_idle_gpu()}"
     fprint(f">> device: {device}", fw)
+    fprint(f">> distance metric: {cfg.dis_metric}", fw)
 
     fprint(">> begin data preprocessing (please wait a few minutes)", fw)
     # Compute data self-KNN for training (prefer C++ precomputed cache)
@@ -270,11 +282,12 @@ if __name__ == "__main__":
     # (3) probing model
     time_start = time.perf_counter()
     print(">> begin get knn distribution and repartition")
-    knn_distr_cnt_data, knn_distr_id_data = get_knn_distr_redundancy(knn_data, data_2_bkt, cfg)
+    # knn_distr_cnt_data, knn_distr_id_data = get_knn_distr_redundancy(knn_data, data_2_bkt, cfg)
+    labels_data = get_knn_labels_data_only(knn_data, data_2_bkt, cfg)
     time_knn_distr = time.perf_counter() - time_start
     fprint(f'>> get knn distribution time: {time_knn_distr}', fw)
     knn_distr_cnt_query, knn_distr_id_query = get_knn_distr_redundancy(knn_query, data_2_bkt, cfg)
-    labels_data = (knn_distr_cnt_data != 0).astype(np.uint8)
+    # labels_data = (knn_distr_cnt_data != 0).astype(np.uint8)
     labels_query = (knn_distr_cnt_query != 0).astype(np.uint8)
     # ------------------------------------------------------------------------------------------
     # observe_knn_tail(knn_distr_cnt, knn_distr_id)
@@ -316,7 +329,7 @@ if __name__ == "__main__":
         results_df = cal_metrics(all_predicts, all_targets, epoch, knn_distr_id_query, cluster_ids, results_df, loss_test, knn=cfg.k)
 
     # (4) redundancy with probing model
-    fprint(f">> begin redundancy with {cfg.duplicate_type}", fw)
+    fprint(f">> begin redundancy with {cfg.duplicate_type}, metric: {cfg.dis_metric}", fw)
     if cfg.duplicate_type == 'model':
         # 使用模型评估所有数据点
         _, data_predicts, _, data_partition_score = model_evaluate(model, train_loader, criterion, device)
@@ -332,7 +345,7 @@ if __name__ == "__main__":
         fprint(">> 测试基准性能（无冗余）...", fw)
         inner_indexes = create_inner_indexes(x_d, cluster_ids, cfg)
         search_time, cmp_distr_all, found_aknn_id = get_cmp_recall(inner_indexes, x_q, cluster_ids, cfg)
-        query_tuning(all_outputs, knn_distr_id_query, found_aknn_id, search_time, cfg, fw, part=0)
+        query_tuning(all_outputs, knn_distr_id_query, found_aknn_id, search_time, cmp_distr_all, cfg, fw, part=0)
         
         # 一次性对前 x% 的数据进行冗余分配
         fprint(f">> 开始对前 {cfg.redundancy_ratio * 100:.1f}% 的向量进行冗余分配...", fw)
@@ -347,7 +360,7 @@ if __name__ == "__main__":
         fprint(f">> 测试冗余后性能（冗余了 {n_redundancy} 个向量）...", fw)
         inner_indexes = create_inner_indexes(x_d, cluster_ids, cfg)
         search_time, cmp_distr_all, found_aknn_id = get_cmp_recall(inner_indexes, x_q, cluster_ids, cfg)
-        query_tuning(all_outputs, knn_distr_id_query, found_aknn_id, search_time, cfg, fw, part=1)
+        query_tuning(all_outputs, knn_distr_id_query, found_aknn_id, search_time, cmp_distr_all, cfg, fw, part=1)
     elif cfg.duplicate_type == 'None':
         # build inner indexes
         time_start = time.perf_counter()
@@ -359,7 +372,7 @@ if __name__ == "__main__":
         search_time, cmp_distr_all, found_aknn_id = get_cmp_recall(inner_indexes, x_q, cluster_ids, cfg)
         time_search = time.perf_counter() - time_start
         fprint(f'>> search time: {time_search}', fw)
-        query_tuning(all_outputs, knn_distr_id_query, found_aknn_id, search_time, cfg, fw)
+        query_tuning(all_outputs, knn_distr_id_query, found_aknn_id, search_time, cmp_distr_all, cfg, fw)
 
     fprint("finish!", fw)
     results_df.to_csv(cfg.pth_log + cfg.df_name, index=False)  # Save DataFrame to CSV

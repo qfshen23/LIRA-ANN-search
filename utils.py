@@ -12,7 +12,6 @@ import pandas as pd
 from tqdm import tqdm
 import random
 import time
-
 np.random.seed(43)
 seed = 43
 np.random.seed(seed)
@@ -358,6 +357,32 @@ def get_knn_distr_redundancy(knn, data_2_bkt, cfg):
             knn_distr_id[v_idx, bkt] = v_mul_knn_ids[v_knn_bkts == bkt].tolist()
     
     return knn_distr_cnt, knn_distr_id
+
+def get_knn_labels_data_only(knn, data_2_bkt, cfg):
+    """
+    只为 data 端生成 0/1 label 矩阵：
+      labels_data[i, bkt] = 1 表示样本 i 在 bucket bkt 里至少有一个 knn
+    不返回 knn_distr_id，不返回完整计数矩阵，避免巨大的 object 数组。
+    """
+    n_data = knn.shape[0]
+    _, n_mul = data_2_bkt.shape
+    n_bkt = cfg.n_bkt
+
+    # 直接生成 0/1，dtype=uint8
+    labels = np.zeros((n_data, n_bkt), dtype=np.uint8)
+
+    for v_idx in tqdm(range(n_data), desc="building labels_data"):
+        v_knn_ids = knn[v_idx]                     # shape (k,)
+        # 每个 knn 映射的 bucket（考虑冗余）
+        v_knn_bkts = data_2_bkt[v_knn_ids].flatten()  # shape (k * n_mul,)
+        unique_bkts = np.unique(v_knn_bkts)
+        # 去掉 -1（没填充的冗余槽）
+        unique_bkts = unique_bkts[unique_bkts != -1]
+        if unique_bkts.size == 0:
+            continue
+        labels[v_idx, unique_bkts] = 1
+
+    return labels
 
 def create_flat_indexes(x_d, xd_id_bkts, cfg, dis_metric: str = 'L2'):
     """
